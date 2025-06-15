@@ -1,100 +1,135 @@
-"""
-This code loads environment variables using the `dotenv` library and sets the necessary environment variables for Azure services.
-The environment variables are loaded from the `.env` file in the same directory as this notebook.
-"""
 import os
+from dotenv import load_dotenv, dotenv_values
+
 from openai import AzureOpenAI
-from dotenv import load_dotenv
-from dotenv import dotenv_values
-
 from langchain import hub
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain_community.document_loaders import AzureAIDocumentIntelligenceLoader
-from langchain_openai import AzureOpenAIEmbeddings
 from langchain.schema import StrOutputParser
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.text_splitter import MarkdownHeaderTextSplitter
-from langchain.vectorstores.azuresearch import AzureSearch
+from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import AzureSearch
+from langchain.chains import RetrievalQA
 
+# === 1. Load environment variables ===
 if os.path.exists(".env"):
     load_dotenv(override=True)
     config = dotenv_values(".env")
+else:
+    raise FileNotFoundError("Missing .env file in the current directory.")
 
-# Set environment variables for Azure services
-doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
-doc_intelligence_key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
+# === 2. Validate and load required configs ===
+def get_env_var(name):
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
 
-azure_openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-azure_openai_chat_completions_deployment_name = os.getenv("AZURE_OPENAI_CHAT_COMPLETIONS_DEPLOYMENT_NAME")
+# Azure service credentials
+doc_intel_endpoint = get_env_var("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+doc_intel_key = get_env_var("AZURE_DOCUMENT_INTELLIGENCE_KEY")
 
-azure_embedding_endpoint = os.getenv("AZURE_EMBEDDING_ENDPOINT")
-azure_openai_embedding_model = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL")
-embedding_vector_dimensions = os.getenv("EMBEDDING_VECTOR_DIMENSIONS")
+aoai_endpoint = get_env_var("AZURE_OPENAI_ENDPOINT")
+aoai_key = get_env_var("AZURE_OPENAI_API_KEY")
+aoai_deployment_name = get_env_var("AZURE_OPENAI_CHAT_COMPLETIONS_DEPLOYMENT_NAME")
 
+embedding_deployment_name = get_env_var("AZURE_OPENAI_EMBEDDING_MODEL")
+embedding_endpoint = get_env_var("AZURE_EMBEDDING_ENDPOINT")
 
+vector_store_endpoint = get_env_var("AZURE_SEARCH_ENDPOINT")
+vector_store_key = get_env_var("AZURE_SEARCH_ADMIN_KEY")
+embedding_dims = int(get_env_var("EMBEDDING_VECTOR_DIMENSIONS"))
 
-# Load a document and split it into semantic chunks
-# Initiate Azure AI Document Intelligence to load the document. You can either specify file_path or url_path to load the document.
-loader = AzureAIDocumentIntelligenceLoader(file_path="<path to your file>", api_key = doc_intelligence_key, api_endpoint = doc_intelligence_endpoint, api_model="prebuilt-layout")
+index_name = "catering-docs-index"
+file_path = "catering docs.pdf"
+
+# === 3. Load and parse document ===
+print("Loading document from:", file_path)
+
+loader = AzureAIDocumentIntelligenceLoader(
+    file_path=file_path,
+    api_key=doc_intel_key,
+    api_endpoint=doc_intel_endpoint,
+    api_model="prebuilt-layout"
+)
 docs = loader.load()
 
-# Split the document into chunks base on markdown headers.
+if not docs or not docs[0].page_content.strip():
+    raise ValueError("Document content is empty or failed to load.")
+
+print("Loaded document successfully.")
+
+# === 4. Split document using markdown headers ===
 headers_to_split_on = [
     ("#", "Header 1"),
     ("##", "Header 2"),
     ("###", "Header 3"),
 ]
-text_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+#text_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
 
-docs_string = docs[0].page_content
-splits = text_splitter.split_text(docs_string)
-
-print("Length of splits: " + str(len(splits)))
-
-# Embed and index the chunks
-# Embed the splitted documents and insert into Azure Search vector store
-
-aoai_embeddings = AzureOpenAIEmbeddings(
-    azure_deployment="<Azure OpenAI embeddings model>",
-    openai_api_version="<Azure OpenAI API version>",  # e.g., "2023-12-01-preview"
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
 )
 
-vector_store_address: str = os.getenv("AZURE_SEARCH_ENDPOINT")
-vector_store_password: str = os.getenv("AZURE_SEARCH_ADMIN_KEY")
+splits = text_splitter.split_documents(docs)
 
-index_name: str = "<your index name>"
-vector_store: AzureSearch = AzureSearch(
-    azure_search_endpoint=vector_store_address,
-    azure_search_key=vector_store_password,
+for i, doc in enumerate(splits):
+    print(f"\nChunk {i+1}:")
+    print(doc.page_content)
+
+print(f"Document split into {len(splits)} chunks.")
+
+# === 5. Initialize embedding model ===
+aoai_embeddings = AzureOpenAIEmbeddings(
+    azure_deployment=embedding_deployment_name,
+    azure_endpoint=embedding_endpoint,
+    openai_api_key=aoai_key,  # Correct arg name now
+    openai_api_version="2024-05-01-preview"
+)
+
+
+# === 6. Initialize Azure Cognitive Search vector store ===
+vector_store = AzureSearch(
+    azure_search_endpoint=vector_store_endpoint,
+    azure_search_key=vector_store_key,
     index_name=index_name,
     embedding_function=aoai_embeddings.embed_query,
 )
 
+# Optional: add documents only if not already indexed
+print("Indexing chunks to Azure Cognitive Search...")
 vector_store.add_documents(documents=splits)
+print("Indexing complete.")
 
-# Get the vector embedding for an input text
-def get_embedding(text: str):
-    
-    openai_embedding_client = AzureOpenAI(
-        azure_endpoint=azure_embedding_endpoint,
-        api_key=azure_openai_api_key,
-        api_version="2024-05-01-preview"
-    )
+# === 7. Create retriever and LLM for Q&A ===
+retriever = vector_store.as_retriever(
+    search_type="similarity",
+    k=3  # ✅ Use `k` directly instead of search_kwargs
+)
 
-    response = openai_embedding_client.embeddings.create(
-        input=text,
-        model=azure_openai_embedding_model,
-    )
 
-    embedding = response.data[0].embedding
-    print(text)
-    return embedding
+llm = AzureChatOpenAI(
+    azure_deployment=aoai_deployment_name,
+    azure_endpoint=aoai_endpoint,
+    api_key=aoai_key,
+    api_version="2024-05-01-preview",
+    temperature=0
+)
 
-# Retrive relevant chunks based on a question
-def get_relevant_documents(question: str):
-    """
-    Retrieve relevant documents based on the question.
-    """
-    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-    return retriever.get_relevant_documents(question)
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True
+)
+
+# === 8. Ask a question ===
+def ask_question(question: str):
+    result = qa_chain.invoke({"query": question})
+    print("\nQUESTION:", question)
+    print("ANSWER:", result["result"])
+    print("\nSOURCE DOCUMENTS:")
+    for doc in result["source_documents"]:
+        print("-", doc.metadata.get("source", "Unknown"))
+
+# === 9. Example Usage ===
+ask_question("What catering services are offered?")
